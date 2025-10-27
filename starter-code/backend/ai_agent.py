@@ -259,7 +259,7 @@ class MockAIAgent(AIAgent):
                     category = cat.upper()
                     t0 = re.sub(rf"\b{cat}\b", " ", t0)
             # Drop common filler words that don't convey product meaning
-            STOPWORDS = {"show", "me", "find", "please", "the", "for"}
+            STOPWORDS = {"show", "me", "find", "please", "the", "for", "recommend", "recommendation", "recommendations", "some", "something", "suggest", "suggestions"}
             tokens = [tok for tok in re.findall(r"[a-z0-9]+", t0) if tok and tok not in STOPWORDS]
             cleaned_query = re.sub(r"\s+", " ", " ".join(tokens)).strip()
             return {"query": cleaned_query, "price_min": price_min, "price_max": price_max, "category": category}
@@ -288,9 +288,19 @@ class MockAIAgent(AIAgent):
         if "add" in lower and ("cart" in lower or "to cart" in lower):
             pid = extract_product_id(text) or "prod_001"
             return {"function": "add_to_cart", "parameters": {"product_id": pid, "quantity": 1}}
-        if "recommend" in lower:
-            pid = extract_product_id(text) or "prod_001"
-            return {"function": "get_recommendations", "parameters": {"based_on": pid, "max_results": 5}}
+        if "recommend" in lower or "recommendation" in lower or "recommendations" in lower:
+            # Prefer explicit product id; otherwise derive a meaningful base
+            pid = extract_product_id(text)
+            if pid:
+                base = pid
+            else:
+                parsed = parse_search_text(text)
+                # strip recommend-like filler again just in case
+                STOP = {"recommend", "recommendation", "recommendations", "some", "something", "please", "the", "me"}
+                q = parsed.get("query") or ""
+                q_tokens = [t for t in (q.split()) if t and t.lower() not in STOP]
+                base = (" ".join(q_tokens)).strip() or parsed.get("category") or "ELECTRONICS"
+            return {"function": "get_recommendations", "parameters": {"based_on": base, "max_results": 5}}
         if any(k in lower for k in ["show cart", "list cart", "show all items in cart", "items in cart", "view cart", "my cart"]) or lower.strip() == "cart":
             return {"function": "get_cart", "parameters": {}}
         if ("remove from cart" in lower) or ("delete from cart" in lower) or lower.startswith("remove ") or lower.startswith("delete "):
@@ -412,13 +422,73 @@ class MockAIAgent(AIAgent):
                         recs = await self.product_service.get_recommendations_by_category(ProductCategory[cat_upper], limit=limit, session=db)
                         ctx["based_on_category"] = cat_upper
                     else:
-                        found = await self.product_service.search_products(query=base, category=None, limit=1, session=db)
-                        if not found and base.endswith("s"):
-                            found = await self.product_service.search_products(query=base[:-1], category=None, limit=1, session=db)
-                        if found:
-                            pid = found[0].id
-                            recs = await self.product_service.get_recommendations(based_on_product_id=pid, limit=limit, session=db)
-                            ctx["based_on_product_id"] = pid
+                        # 1) Try a lightweight synonym map from common nouns -> categories
+                        synonyms = {
+                            "laptop": "ELECTRONICS", "laptops": "ELECTRONICS", "notebook": "ELECTRONICS",
+                            "keyboard": "ELECTRONICS", "keyboards": "ELECTRONICS",
+                            "mouse": "ELECTRONICS", "mice": "ELECTRONICS",
+                            "monitor": "ELECTRONICS", "camera": "ELECTRONICS", "speaker": "ELECTRONICS",
+                            "headphone": "ELECTRONICS", "headphones": "ELECTRONICS",
+                            "shoe": "SPORTS", "shoes": "SPORTS", "racket": "SPORTS", "tennis": "SPORTS",
+                            "tshirt": "CLOTHING", "t-shirt": "CLOTHING", "shirt": "CLOTHING",
+                            "chair": "HOME", "chairs": "HOME", "bottle": "HOME", "bottles": "HOME",
+                            "book": "BOOKS", "books": "BOOKS",
+                            "shampoo": "BEAUTY", "moisturizer": "BEAUTY", "skincare": "BEAUTY", "cream": "BEAUTY"
+                        }
+                        tokens = [t for t in base.lower().split() if t]
+                        mapped_cat = None
+                        for tkn in tokens:
+                            if tkn in synonyms:
+                                mapped_cat = synonyms[tkn]
+                                break
+                        if mapped_cat:
+                            recs = await self.product_service.get_recommendations_by_category(ProductCategory[mapped_cat], limit=limit, session=db)
+                            ctx["based_on_category"] = mapped_cat
+                            ctx["source"] = "synonym_map"
+                        else:
+                            # 2) Direct query matches as recommendations
+                            direct = await self.product_service.search_products(query=base, category=None, limit=limit, session=db)
+                            if not direct and base.endswith("s"):
+                                direct = await self.product_service.search_products(query=base[:-1], category=None, limit=limit, session=db)
+                            if direct:
+                                ctx["source"] = "query_match"
+                                return {"function": name, "parameters": params, "result": {
+                                    "recommendations": [r.model_dump(mode="json") for r in direct],
+                                    "recommendation_context": ctx,
+                                }}
+
+                            # 3) Fall back to "similar by category" seeded from nearest product
+                            found = await self.product_service.search_products(query=base, category=None, limit=1, session=db)
+                            if not found and base.endswith("s"):
+                                found = await self.product_service.search_products(query=base[:-1], category=None, limit=1, session=db)
+                            if found:
+                                pid = found[0].id
+                                recs = await self.product_service.get_recommendations(based_on_product_id=pid, limit=limit, session=db)
+                                ctx["based_on_product_id"] = pid
+
+                # 4) If still empty, show search-similar list so user sees something
+                if not recs:
+                    q = base[:-1] if base.endswith("s") else base
+                    similar = await self.product_service.search_products(query=q, category=None, limit=limit, session=db)
+                    if similar:
+                        ctx["fallback"] = "search_similar"
+                        ctx["query"] = base
+                        return {"function": name, "parameters": params, "result": {
+                            "recommendations": [r.model_dump(mode="json") for r in similar],
+                            "recommendation_context": ctx,
+                        }}
+                # Fallback: if nothing matched, surface similar items via search results
+                if not recs:
+                    q = base[:-1] if base.endswith("s") else base
+                    similar = await self.product_service.search_products(query=q, category=None, limit=limit, session=db)
+                    if similar:
+                        ctx["fallback"] = "search_similar"
+                        ctx["query"] = base
+                        return {"function": name, "parameters": params, "result": {
+                            "recommendations": [r.model_dump(mode="json") for r in similar],
+                            "recommendation_context": ctx,
+                        }}
+
                 return {"function": name, "parameters": params, "result": {
                     "recommendations": [r.model_dump(mode="json") for r in recs],
                     "recommendation_context": ctx,
@@ -579,7 +649,7 @@ def parse_search_text(text: str) -> Dict[str, Any]:
             category = cat.upper()
             t = re.sub(rf"\b{cat}\b", " ", t)
     # Remove common filler words to improve matching
-    STOPWORDS = {"show", "me", "find", "please", "the", "for"}
+    STOPWORDS = {"show", "me", "find", "please", "the", "for", "recommend", "recommendation", "recommendations", "some", "something", "suggest", "suggestions"}
     tokens = [tok for tok in re.findall(r"[a-z0-9]+", t) if tok and tok not in STOPWORDS]
     cleaned_query = re.sub(r"\s+", " ", " ".join(tokens)).strip()
     return {"query": cleaned_query, "price_min": price_min, "price_max": price_max, "category": category}
