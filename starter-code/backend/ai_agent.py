@@ -258,7 +258,10 @@ class MockAIAgent(AIAgent):
                 if re.search(rf"\b{cat}\b", t0):
                     category = cat.upper()
                     t0 = re.sub(rf"\b{cat}\b", " ", t0)
-            cleaned_query = re.sub(r"\s+", " ", t0).strip()
+            # Drop common filler words that don't convey product meaning
+            STOPWORDS = {"show", "me", "find", "please", "the", "for"}
+            tokens = [tok for tok in re.findall(r"[a-z0-9]+", t0) if tok and tok not in STOPWORDS]
+            cleaned_query = re.sub(r"\s+", " ", " ".join(tokens)).strip()
             return {"query": cleaned_query, "price_min": price_min, "price_max": price_max, "category": category}
 
         lower = text.lower()
@@ -380,10 +383,17 @@ class MockAIAgent(AIAgent):
                     validation = await self.context_manager.validate_product_id(session_id=session_id, product_id=prod_id, session=db)
                     product = await self.product_service.get_product_by_id(prod_id, session=db)
                     recs = await self.product_service.get_recommendations(based_on_product_id=prod_id, limit=4, session=db)
+                    # Allow viewing details for known products even if not in recent search context.
+                    # Keep context signal for UI but do not block rendering.
+                    validation_out = dict(validation or {})
+                    validation_out["in_recent_search"] = bool(validation_out.get("valid", False))
+                    validation_out["context_valid"] = bool(validation_out.get("valid", False))
+                    validation_out["product_exists"] = bool(product)
+                    validation_out["valid"] = bool(product)
                     return {"function": name, "parameters": params, "result": {
                         "product": product.model_dump(mode="json") if product else None,
                         "recommendations": [r.model_dump(mode="json") for r in recs],
-                        "validation": validation,
+                        "validation": validation_out,
                     }}
 
             # get_recommendations
@@ -568,7 +578,10 @@ def parse_search_text(text: str) -> Dict[str, Any]:
         if re.search(rf"\b{cat}\b", t):
             category = cat.upper()
             t = re.sub(rf"\b{cat}\b", " ", t)
-    cleaned_query = re.sub(r"\s+", " ", t).strip()
+    # Remove common filler words to improve matching
+    STOPWORDS = {"show", "me", "find", "please", "the", "for"}
+    tokens = [tok for tok in re.findall(r"[a-z0-9]+", t) if tok and tok not in STOPWORDS]
+    cleaned_query = re.sub(r"\s+", " ", " ".join(tokens)).strip()
     return {"query": cleaned_query, "price_min": price_min, "price_max": price_max, "category": category}
 
 def infer_function_call_from_text(text: str) -> Optional[Dict[str, Any]]:

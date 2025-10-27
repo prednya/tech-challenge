@@ -536,7 +536,16 @@ async def api_remove_from_cart(body: dict, session: AsyncSession = Depends(get_s
     item_id = body.get("item_id")
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
-    if product_id:
+
+    # Prefer removal by item_id without context validation so users can always
+    # remove items (including those added from recommendations).
+    if item_id is not None:
+        await session.execute(
+            delete(CartItem).where(CartItem.session_id == session_id, CartItem.id == item_id)
+        )
+        await session.commit()
+    elif product_id:
+        # Only validate when removing by product_id (not when removing by item_id)
         validation = await context_manager.validate_product_id(session_id, product_id, session)
         if not validation.get("valid", False):
             raise HTTPException(status_code=400, detail={
@@ -544,12 +553,9 @@ async def api_remove_from_cart(body: dict, session: AsyncSession = Depends(get_s
                 "message": f"Product ID '{product_id}' not found in recent searches",
                 "suggestions": validation.get("suggestions", []),
             })
-
-    if item_id is not None:
-        await session.execute(delete(CartItem).where(CartItem.session_id == session_id, CartItem.id == item_id))
-        await session.commit()
-    elif product_id:
-        await session.execute(delete(CartItem).where(CartItem.session_id == session_id, CartItem.product_id == product_id))
+        await session.execute(
+            delete(CartItem).where(CartItem.session_id == session_id, CartItem.product_id == product_id)
+        )
         await session.commit()
 
     items = (await session.execute(select(CartItem).where(CartItem.session_id == session_id))).scalars().all()
@@ -590,20 +596,22 @@ async def api_update_cart(body: dict, session: AsyncSession = Depends(get_sessio
     if not session_id or not product_id or delta == 0:
         raise HTTPException(status_code=400, detail="session_id, product_id and non-zero delta are required")
 
-    validation = await context_manager.validate_product_id(session_id, product_id, session)
-    if not validation.get("valid", False):
-        raise HTTPException(status_code=400, detail={
-            "code": "INVALID_PRODUCT_ID",
-            "message": f"Product ID '{product_id}' not found in recent searches",
-            "suggestions": validation.get("suggestions", []),
-        })
-
     res = await session.execute(select(CartItem).where(CartItem.session_id == session_id, CartItem.product_id == product_id))
     item = res.scalar_one_or_none()
     prod = await product_service.get_product_by_id(product_id, session=session)
     if not prod:
         raise HTTPException(status_code=404, detail="Product not found")
+    # Relax validation for updates of existing items so users can adjust quantities
+    # of items added from recommendations (which might not be in recent search context).
     if item is None and delta > 0:
+        # Only when creating a new cart row do we enforce recent-search validation
+        validation = await context_manager.validate_product_id(session_id, product_id, session)
+        if not validation.get("valid", False):
+            raise HTTPException(status_code=400, detail={
+                "code": "INVALID_PRODUCT_ID",
+                "message": f"Product ID '{product_id}' not found in recent searches",
+                "suggestions": validation.get("suggestions", []),
+            })
         item = CartItem(session_id=session_id, product_id=product_id, quantity=delta, unit_price=prod.price, total_price=prod.price * delta)
         session.add(item)
         await session.commit()

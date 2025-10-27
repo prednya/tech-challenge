@@ -176,8 +176,13 @@ const ChatInterface: React.FC = () => {
               } else if (action === 'remove_from_cart') {
                 // Call REST endpoint directly, then refresh cart view silently
                 const payload: any = { session_id: sessionId };
-                if (data?.product_id) payload.product_id = data.product_id;
-                if (data?.item_id) payload.item_id = data.item_id;
+                // Prefer removing by item_id to avoid validation issues when
+                // the product wasn't part of the recent search context.
+                if (data?.item_id) {
+                  payload.item_id = data.item_id;
+                } else if (data?.product_id) {
+                  payload.product_id = data.product_id;
+                }
                 fetch(`/api/functions/remove_from_cart`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
